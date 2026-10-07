@@ -48,6 +48,8 @@ class LootTable:
         """
         if not isinstance(weight, int) or isinstance(weight, bool):
             raise LootError("weight must be an integer")
+        if weight < 0:
+            raise LootError("weight must not be negative")
         if item_id in self._index:
             raise LootError("duplicate item id: %r" % (item_id,))
         self._index[item_id] = len(self._ids)
@@ -72,14 +74,14 @@ class LootTable:
     # -- accounting -----------------------------------------------------
     def total_weight(self, rarity=None):
         """Weight of the pool."""
-        return sum(self._weights)
+        return sum(self._weights[self._index[item_id]] for item_id in self.pool(rarity))
 
     def prefix_sums(self, rarity=None):
         """Running total of the pool, entry by entry."""
         running = []
         acc = 0
-        for weight in self._weights:
-            acc += weight
+        for item_id in self.pool(rarity):
+            acc += self._weights[self._index[item_id]]
             running.append(acc)
         return running
 
@@ -90,39 +92,67 @@ class LootTable:
             raise LootError("the pool carries no weight")
         shares = {}
         for item_id in self.pool(rarity):
-            shares[item_id] = self._weights[self._index[item_id]] * 100 // total / 100.0
+            shares[item_id] = self._weights[self._index[item_id]] / total
         return shares
 
     # -- drawing --------------------------------------------------------
     def draw(self, n=1, rarity=None):
         """Draw ``n`` entries with replacement, in sequence."""
+        self._check_count(n)
         return [self._pick(rarity) for _ in range(n)]
 
     def draw_unique(self, n, rarity=None):
         """Draw ``n`` distinct entries, in sequence."""
-        size = len(self.pool(rarity))
-        if n > size:
-            raise LootError("cannot draw %d distinct entries out of %d" % (n, size))
+        self._check_count(n)
+        remaining = [
+            item_id
+            for item_id in self.pool(rarity)
+            if self._weights[self._index[item_id]] > 0
+        ]
+        if n > len(remaining):
+            raise LootError(
+                "cannot draw %d distinct entries out of %d" % (n, len(remaining))
+            )
         picked = []
         for _ in range(n):
-            item_id = self._pick(rarity)
+            weights = [self._weights[self._index[item_id]] for item_id in remaining]
+            item_id = self._weighted_pick(remaining, weights)
             picked.append(item_id)
-            self._weights[self._index[item_id]] = 0
+            remaining.remove(item_id)
+            self._account(item_id)
         return picked
+
+    @staticmethod
+    def _check_count(n):
+        """Validate a draw count."""
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise LootError("draw count must be a positive integer")
 
     def _pick(self, rarity=None):
         """One weighted pick, or the pity item when its streak is due."""
         if self._pity_item is not None and self._misses >= self._pity_threshold:
+            self._misses = 0
             return self._pity_item
         ids = self.pool(rarity)
-        roll = self._rng.randrange(self.total_weight(rarity))
-        item_id = ids[-1]
-        for position, bound in enumerate(self.prefix_sums(rarity)):
-            if roll <= bound:
-                item_id = ids[position]
-                break
+        if not ids:
+            raise LootError("cannot draw from an empty pool")
+        weights = [self._weights[self._index[item_id]] for item_id in ids]
+        item_id = self._weighted_pick(ids, weights)
         self._account(item_id)
         return item_id
+
+    def _weighted_pick(self, ids, weights):
+        """One weighted pick over ``ids`` using a single ``randrange`` call."""
+        total = sum(weights)
+        if total <= 0:
+            raise LootError("the pool carries no weight")
+        roll = self._rng.randrange(total)
+        acc = 0
+        for item_id, weight in zip(ids, weights):
+            acc += weight
+            if roll < acc:
+                return item_id
+        return ids[-1]
 
     def _account(self, item_id):
         """Update the pity streak after a weighted pick."""
